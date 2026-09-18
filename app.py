@@ -48,11 +48,11 @@ st.info(
 def haversine(lat1, lon1, lat2, lon2):
     radius = 6371.0
 
-    lat1 = math.radians(lat1)
-    lat2 = math.radians(lat2)
+    lat1 = math.radians(float(lat1))
+    lat2 = math.radians(float(lat2))
 
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
+    dlat = math.radians(float(lat2) - float(lat1))
+    dlon = math.radians(float(lon2) - float(lon1))
 
     a = (
         math.sin(dlat / 2) ** 2
@@ -60,6 +60,8 @@ def haversine(lat1, lon1, lat2, lon2):
         * math.cos(lat2)
         * math.sin(dlon / 2) ** 2
     )
+
+    a = min(1.0, max(0.0, a))
 
     return 2 * radius * math.asin(math.sqrt(a))
 
@@ -134,11 +136,15 @@ def clean_data(df):
 
     df = df.copy()
 
+    if df.empty:
+        raise ValueError("The dataset is empty.")
+
     df.columns = (
         df.columns
+        .astype(str)
         .str.strip()
         .str.lower()
-        .str.replace(" ", "_")
+        .str.replace(" ", "_", regex=False)
     )
 
     rename_map = {}
@@ -153,14 +159,16 @@ def clean_data(df):
         for col in ["lat"]:
             if col in df.columns:
                 rename_map[col] = "latitude"
+                break
 
     if "longitude" not in df.columns:
         for col in ["lon", "lng"]:
             if col in df.columns:
                 rename_map[col] = "longitude"
+                break
 
     if "timestamp" not in df.columns:
-        for col in ["datetime", "date_time", "time"]:
+        for col in ["datetime", "date_time", "time", "date"]:
             if col in df.columns:
                 rename_map[col] = "timestamp"
                 break
@@ -172,6 +180,11 @@ def clean_data(df):
             "CSV must contain Latitude and Longitude columns."
         )
 
+    # Create user ID if missing
+    if "user_id" not in df.columns:
+        df["user_id"] = "SINGLE_USER"
+
+    # Convert coordinates to numeric
     df["latitude"] = pd.to_numeric(
         df["latitude"],
         errors="coerce"
@@ -182,18 +195,22 @@ def clean_data(df):
         errors="coerce"
     )
 
+    # Remove missing GPS values
     df.dropna(
         subset=["latitude", "longitude"],
         inplace=True
     )
 
+    # Validate GPS coordinates
     df = df[
         df["latitude"].between(-90, 90)
         & df["longitude"].between(-180, 180)
     ]
 
+    # Remove duplicates
     df.drop_duplicates(inplace=True)
 
+    # Timestamp processing
     if "timestamp" in df.columns:
 
         df["timestamp"] = pd.to_datetime(
@@ -209,19 +226,21 @@ def clean_data(df):
             freq="10min"
         )
 
+    # Remove invalid timestamps
     df.dropna(
         subset=["timestamp"],
         inplace=True
     )
 
     df.sort_values(
-        ["user_id", "timestamp"]
-        if "user_id" in df.columns
-        else ["timestamp"],
+        ["user_id", "timestamp"],
         inplace=True
     )
 
-    df.reset_index(drop=True, inplace=True)
+    df.reset_index(
+        drop=True,
+        inplace=True
+    )
 
     return df
 
@@ -234,44 +253,30 @@ def feature_engineering(df):
 
     df = df.copy()
 
-    if "user_id" in df.columns:
+    # Previous location for each user
+    df["previous_latitude"] = (
+        df.groupby("user_id")["latitude"]
+        .shift(1)
+    )
 
-        df["previous_latitude"] = (
-            df.groupby("user_id")["latitude"]
-            .shift(1)
-        )
+    df["previous_longitude"] = (
+        df.groupby("user_id")["longitude"]
+        .shift(1)
+    )
 
-        df["previous_longitude"] = (
-            df.groupby("user_id")["longitude"]
-            .shift(1)
-        )
+    df["previous_timestamp"] = (
+        df.groupby("user_id")["timestamp"]
+        .shift(1)
+    )
 
-        df["previous_timestamp"] = (
-            df.groupby("user_id")["timestamp"]
-            .shift(1)
-        )
-
-    else:
-
-        df["previous_latitude"] = (
-            df["latitude"].shift(1)
-        )
-
-        df["previous_longitude"] = (
-            df["longitude"].shift(1)
-        )
-
-        df["previous_timestamp"] = (
-            df["timestamp"].shift(1)
-        )
-
+    # Distance calculation
     distances = []
 
     for _, row in df.iterrows():
 
         if pd.isna(row["previous_latitude"]):
 
-            distances.append(0)
+            distances.append(0.0)
 
         else:
 
@@ -286,6 +291,7 @@ def feature_engineering(df):
 
     df["distance_km"] = distances
 
+    # Time gap
     df["time_gap_minutes"] = (
         (
             df["timestamp"]
@@ -301,6 +307,7 @@ def feature_engineering(df):
         .clip(lower=0.1)
     )
 
+    # Speed
     df["speed_kmh"] = (
         df["distance_km"]
         / (df["time_gap_minutes"] / 60)
@@ -308,8 +315,12 @@ def feature_engineering(df):
 
     df["speed_kmh"] = (
         df["speed_kmh"]
-        .replace([np.inf, -np.inf], np.nan)
+        .replace(
+            [np.inf, -np.inf],
+            np.nan
+        )
         .fillna(0)
+        .clip(upper=300)
     )
 
     # Time features
@@ -325,19 +336,23 @@ def feature_engineering(df):
     # Geographic area
     cell = 0.01
 
+    lat_cell = (
+        (df["latitude"] / cell)
+        .round()
+        * cell
+    ).round(4)
+
+    lon_cell = (
+        (df["longitude"] / cell)
+        .round()
+        * cell
+    ).round(4)
+
     df["area"] = (
-        (
-            df["latitude"] / cell
-        ).round() * cell
-    ).round(4).astype(str)
-
-    df["area"] += "_"
-
-    df["area"] += (
-        (
-            df["longitude"] / cell
-        ).round() * cell
-    ).round(4).astype(str)
+        lat_cell.astype(str)
+        + "_"
+        + lon_cell.astype(str)
+    )
 
     return df
 
@@ -352,8 +367,18 @@ def perform_clustering(df, n_clusters):
         ["latitude", "longitude"]
     ].copy()
 
+    actual_clusters = min(
+        int(n_clusters),
+        len(coordinates)
+    )
+
+    if actual_clusters < 2:
+        raise ValueError(
+            "At least 2 GPS records are required for clustering."
+        )
+
     model = KMeans(
-        n_clusters=n_clusters,
+        n_clusters=actual_clusters,
         random_state=42,
         n_init=10
     )
@@ -393,7 +418,7 @@ def perform_anomaly_detection(df, contamination):
 
     model = IsolationForest(
         n_estimators=250,
-        contamination=contamination,
+        contamination=float(contamination),
         random_state=42
     )
 
@@ -422,51 +447,28 @@ def prepare_prediction_data(df):
 
     data = df.copy()
 
-    if "user_id" in data.columns:
+    data["average_speed"] = (
+        data.groupby("user_id")["speed_kmh"]
+        .transform("mean")
+    )
 
-        data["average_speed"] = (
-            data.groupby("user_id")["speed_kmh"]
-            .transform("mean")
-        )
+    data["average_distance"] = (
+        data.groupby("user_id")["distance_km"]
+        .transform("mean")
+    )
 
-        data["average_distance"] = (
-            data.groupby("user_id")["distance_km"]
-            .transform("mean")
-        )
+    data["visit_frequency"] = (
+        data.groupby(
+            ["user_id", "area"]
+        )["area"]
+        .transform("count")
+    )
 
-        data["visit_frequency"] = (
-            data.groupby(
-                ["user_id", "area"]
-            )["area"]
-            .transform("count")
-        )
-
-        data["previous_area"] = (
-            data.groupby("user_id")["area"]
-            .shift(1)
-            .fillna("UNKNOWN")
-        )
-
-    else:
-
-        data["average_speed"] = (
-            data["speed_kmh"].mean()
-        )
-
-        data["average_distance"] = (
-            data["distance_km"].mean()
-        )
-
-        data["visit_frequency"] = (
-            data.groupby("area")["area"]
-            .transform("count")
-        )
-
-        data["previous_area"] = (
-            data["area"]
-            .shift(1)
-            .fillna("UNKNOWN")
-        )
+    data["previous_area"] = (
+        data.groupby("user_id")["area"]
+        .shift(1)
+        .fillna("UNKNOWN")
+    )
 
     feature_columns = [
         "latitude",
@@ -495,16 +497,34 @@ def prepare_prediction_data(df):
     y = data["area"].astype(str)
 
     # Remove very rare target classes
+    # At least 5 observations are required
+    # so train/test splitting remains reliable.
     counts = y.value_counts()
 
+    valid_classes = counts[
+        counts >= 5
+    ].index
+
     valid = y.isin(
-        counts[counts >= 2].index
+        valid_classes
     )
 
-    X = X.loc[valid]
-    y = y.loc[valid]
+    X = X.loc[valid].copy()
+    y = y.loc[valid].copy()
+    valid_data = data.loc[valid].copy()
 
-    return data.loc[valid], X, y
+    if len(X) < 20:
+        raise ValueError(
+            "Not enough valid records for location prediction. "
+            "Use a larger dataset."
+        )
+
+    if y.nunique() < 2:
+        raise ValueError(
+            "At least two location classes are required."
+        )
+
+    return valid_data, X, y
 
 
 # ============================================================
@@ -518,18 +538,30 @@ def train_random_forest(X, y):
             "At least two location classes are required."
         )
 
-    stratify = (
-        y
-        if y.value_counts().min() >= 2
-        else None
+    class_counts = y.value_counts()
+
+    # Every class has at least 5 records because of
+    # prepare_prediction_data().
+    min_class_count = int(
+        class_counts.min()
+    )
+
+    test_size = max(
+        0.25,
+        y.nunique() / len(y) + 0.01
+    )
+
+    test_size = min(
+        test_size,
+        0.40
     )
 
     X_train, X_test, y_train, y_test = train_test_split(
         X,
         y,
-        test_size=0.25,
+        test_size=test_size,
         random_state=42,
-        stratify=stratify
+        stratify=y
     )
 
     model = RandomForestClassifier(
@@ -537,7 +569,8 @@ def train_random_forest(X, y):
         max_depth=15,
         min_samples_leaf=2,
         class_weight="balanced",
-        random_state=42
+        random_state=42,
+        n_jobs=-1
     )
 
     model.fit(
@@ -554,27 +587,32 @@ def train_random_forest(X, y):
             y_test,
             predictions
         ),
+
         "precision": precision_score(
             y_test,
             predictions,
             average="weighted",
             zero_division=0
         ),
+
         "recall": recall_score(
             y_test,
             predictions,
             average="weighted",
             zero_division=0
         ),
+
         "f1": f1_score(
             y_test,
             predictions,
             average="weighted",
             zero_division=0
         ),
+
         "confusion_matrix": confusion_matrix(
             y_test,
-            predictions
+            predictions,
+            labels=model.classes_
         )
     }
 
@@ -588,6 +626,10 @@ def train_random_forest(X, y):
     )
 
 
+# ============================================================
+# TOP-K ACCURACY
+# ============================================================
+
 def top_k_accuracy(model, X_test, y_test, k):
 
     probabilities = model.predict_proba(
@@ -599,7 +641,7 @@ def top_k_accuracy(model, X_test, y_test, k):
     )
 
     k = min(
-        k,
+        int(k),
         len(classes)
     )
 
@@ -627,17 +669,10 @@ def create_markov_chain(df):
 
     transitions = defaultdict(Counter)
 
-    if "user_id" in df.columns:
-
-        groups = df.sort_values(
-            "timestamp"
-        ).groupby("user_id")
-
-    else:
-
-        groups = [
-            ("single_user", df.sort_values("timestamp"))
-        ]
+    groups = (
+        df.sort_values("timestamp")
+        .groupby("user_id")
+    )
 
     for _, group in groups:
 
@@ -666,32 +701,54 @@ def create_markov_chain(df):
             counter.values()
         )
 
-        probabilities[current] = {
-            nxt: count / total
-            for nxt, count
-            in counter.items()
-        }
+        if total > 0:
+
+            probabilities[current] = {
+                nxt: count / total
+                for nxt, count
+                in counter.items()
+            }
 
     return probabilities
 
 
-def predict_route(markov, start_area, steps=4):
+def predict_route(
+    markov,
+    start_area,
+    steps=4
+):
 
     route = [start_area]
 
     current = start_area
+
+    visited = {start_area}
 
     for _ in range(steps):
 
         if current not in markov:
             break
 
+        available = {
+            area: probability
+            for area, probability
+            in markov[current].items()
+            if area not in visited
+        }
+
+        if not available:
+            break
+
         next_area = max(
-            markov[current],
-            key=markov[current].get
+            available,
+            key=available.get
         )
 
         route.append(
+            next_area
+        )
+
+        visited.add(
             next_area
         )
 
@@ -722,7 +779,7 @@ def calculate_priority(
         + anomaly_evidence * 0.10
     )
 
-    return score
+    return float(score)
 
 
 def priority_category(score):
@@ -743,7 +800,9 @@ def priority_category(score):
 # SIDEBAR
 # ============================================================
 
-st.sidebar.header("⚙️ Project Controls")
+st.sidebar.header(
+    "⚙️ Project Controls"
+)
 
 uploaded_file = st.sidebar.file_uploader(
     "Upload GPS CSV",
@@ -829,17 +888,39 @@ except Exception as error:
 # MODELS
 # ============================================================
 
-cluster_model, data = perform_clustering(
-    data,
-    number_clusters
-)
+try:
 
-anomaly_model, anomaly_scaler, data = (
-    perform_anomaly_detection(
+    cluster_model, data = perform_clustering(
         data,
-        contamination
+        number_clusters
     )
-)
+
+except Exception as error:
+
+    st.error(
+        f"Clustering error: {error}"
+    )
+
+    st.stop()
+
+
+try:
+
+    anomaly_model, anomaly_scaler, data = (
+        perform_anomaly_detection(
+            data,
+            contamination
+        )
+    )
+
+except Exception as error:
+
+    st.error(
+        f"Anomaly detection error: {error}"
+    )
+
+    st.stop()
+
 
 try:
 
@@ -865,6 +946,11 @@ except Exception as error:
         f"Location model error: {error}"
     )
 
+    st.info(
+        "Try using the built-in synthetic dataset "
+        "or upload a larger GPS dataset."
+    )
+
     st.stop()
 
 
@@ -877,9 +963,13 @@ markov = create_markov_chain(
 # FICTIONAL CASE
 # ============================================================
 
-st.header("📁 Fictional Case Information")
+st.header(
+    "📁 Fictional Case Information"
+)
 
-case_col1, case_col2, case_col3, case_col4 = st.columns(4)
+case_col1, case_col2, case_col3, case_col4 = (
+    st.columns(4)
+)
 
 with case_col1:
 
@@ -940,6 +1030,10 @@ previous_area = st.selectbox(
 )
 
 
+# ============================================================
+# LAST KNOWN LOCATION
+# ============================================================
+
 last_area_data = data[
     data["area"].astype(str)
     == last_known_area
@@ -948,7 +1042,6 @@ last_area_data = data[
 if len(last_area_data) == 0:
 
     last_area_data = data.head(1)
-
 
 last_latitude = float(
     last_area_data["latitude"].mean()
@@ -984,7 +1077,9 @@ tabs = st.tabs([
 
 with tabs[0]:
 
-    st.header("Dataset Overview")
+    st.header(
+        "Dataset Overview"
+    )
 
     c1, c2, c3, c4 = st.columns(4)
 
@@ -996,8 +1091,6 @@ with tabs[0]:
     c2.metric(
         "Unique Users",
         data["user_id"].nunique()
-        if "user_id" in data.columns
-        else 1
     )
 
     c3.metric(
@@ -1170,13 +1263,17 @@ with tabs[3]:
         anomaly_count
     )
 
-    st.bar_chart(
+    anomaly_chart = (
         data["anomaly"]
         .value_counts()
         .rename({
             0: "Normal",
             1: "Anomaly"
         })
+    )
+
+    st.bar_chart(
+        anomaly_chart
     )
 
     anomalies = (
@@ -1258,7 +1355,10 @@ with tabs[4]:
         f"{top_k_accuracy(location_model, X_test, y_test, 5):.3f}"
     )
 
-    # Build prediction row
+    # ========================================================
+    # BUILD CASE PREDICTION ROW
+    # ========================================================
+
     template = prediction_data.iloc[0].copy()
 
     template["latitude"] = last_latitude
@@ -1315,6 +1415,7 @@ with tabs[4]:
         dtype=float
     )
 
+    # Match training columns exactly
     case_X = case_X.reindex(
         columns=X_train.columns,
         fill_value=0
@@ -1466,6 +1567,7 @@ with tabs[6]:
             "Time Relevance",
             "Anomaly Evidence"
         ],
+
         "Weight (%)": [
             30,
             20,
@@ -1506,7 +1608,10 @@ with tabs[6]:
 
         visit_frequency = min(
             float(
-                frequency.get(area, 0)
+                frequency.get(
+                    area,
+                    0
+                )
             ),
             100
         )
@@ -1522,6 +1627,9 @@ with tabs[6]:
             data["area"].astype(str)
             == area
         ]
+
+        if area_rows.empty:
+            continue
 
         area_lat = area_rows[
             "latitude"
@@ -1550,6 +1658,12 @@ with tabs[6]:
 
         time_difference = abs(
             case_hour - typical_hour
+        )
+
+        # Handle circular clock distance
+        time_difference = min(
+            time_difference,
+            24 - time_difference
         )
 
         time_relevance = (
@@ -1595,22 +1709,30 @@ with tabs[6]:
         priority_rows
     )
 
-    priority_df.sort_values(
-        "Priority Score",
-        ascending=False,
-        inplace=True
-    )
+    if not priority_df.empty:
 
-    priority_df["Priority Score"] = (
-        priority_df["Priority Score"]
-        .round(2)
-    )
+        priority_df.sort_values(
+            "Priority Score",
+            ascending=False,
+            inplace=True
+        )
 
-    st.dataframe(
-        priority_df,
-        hide_index=True,
-        use_container_width=True
-    )
+        priority_df["Priority Score"] = (
+            priority_df["Priority Score"]
+            .round(2)
+        )
+
+        st.dataframe(
+            priority_df,
+            hide_index=True,
+            use_container_width=True
+        )
+
+    else:
+
+        st.info(
+            "Priority scores could not be calculated."
+        )
 
 
 # ============================================================
@@ -1648,44 +1770,45 @@ with tabs[7]:
 
     if not priority_df.empty:
 
-        best_area = priority_df.iloc[0]
+        explanation_area = priority_df.iloc[0]
 
         st.subheader(
             "Prediction Explanation"
         )
 
         st.write(
-            f"**Area:** {best_area['Area']}"
+            f"**Area:** "
+            f"{explanation_area['Area']}"
         )
 
         st.write(
             f"**ML probability:** "
-            f"{best_area['ML Probability']:.2f}%"
+            f"{explanation_area['ML Probability']:.2f}%"
         )
 
         st.write(
             f"**Historical visit frequency:** "
-            f"{best_area['Visit Frequency']:.2f}%"
+            f"{explanation_area['Visit Frequency']:.2f}%"
         )
 
         st.write(
             f"**Route similarity:** "
-            f"{best_area['Route Similarity']:.2f}%"
+            f"{explanation_area['Route Similarity']:.2f}%"
         )
 
         st.write(
             f"**Distance relevance:** "
-            f"{best_area['Distance Relevance']:.2f}%"
+            f"{explanation_area['Distance Relevance']:.2f}%"
         )
 
         st.write(
             f"**Time relevance:** "
-            f"{best_area['Time Relevance']:.2f}%"
+            f"{explanation_area['Time Relevance']:.2f}%"
         )
 
         st.write(
             f"**Anomaly evidence:** "
-            f"{best_area['Anomaly Evidence']:.2f}%"
+            f"{explanation_area['Anomaly Evidence']:.2f}%"
         )
 
         st.info(
@@ -1716,7 +1839,10 @@ with tabs[8]:
         control_scale=True
     )
 
-    # Last known location
+    # ========================================================
+    # LAST KNOWN LOCATION
+    # ========================================================
+
     folium.Marker(
         [
             last_latitude,
@@ -1726,7 +1852,8 @@ with tabs[8]:
         popup=(
             f"Case: {case_id}<br>"
             f"Area: {last_known_area}<br>"
-            f"Weather: {weather}"
+            f"Weather: {weather}<br>"
+            f"Age Group: {age_group}"
         ),
         icon=folium.Icon(
             icon="info-sign"
@@ -1735,7 +1862,10 @@ with tabs[8]:
         investigation_map
     )
 
-    # Area centers
+    # ========================================================
+    # AREA CENTERS
+    # ========================================================
+
     area_centers = (
         data.groupby("area")
         .agg(
@@ -1748,18 +1878,20 @@ with tabs[8]:
 
     for _, row in area_centers.iterrows():
 
+        radius = max(
+            4,
+            min(
+                12,
+                4 + float(row["visits"]) / 100
+            )
+        )
+
         folium.CircleMarker(
             location=[
                 row["latitude"],
                 row["longitude"]
             ],
-            radius=max(
-                4,
-                min(
-                    12,
-                    4 + row["visits"] / 100
-                )
-            ),
+            radius=radius,
             tooltip=(
                 f"{row['area']} | "
                 f"Visits: {row['visits']}"
@@ -1773,7 +1905,10 @@ with tabs[8]:
             investigation_map
         )
 
-    # Top predicted areas
+    # ========================================================
+    # TOP PREDICTED AREAS
+    # ========================================================
+
     for _, row in predictions.head(5).iterrows():
 
         match = area_centers[
@@ -1805,7 +1940,10 @@ with tabs[8]:
                 investigation_map
             )
 
-    # Anomalous locations
+    # ========================================================
+    # ANOMALOUS LOCATIONS
+    # ========================================================
+
     for _, row in (
         data[data["anomaly"] == 1]
         .head(150)
@@ -1829,7 +1967,10 @@ with tabs[8]:
             investigation_map
         )
 
-    # Route line
+    # ========================================================
+    # MARKOV ROUTE LINE
+    # ========================================================
+
     if last_known_area in markov:
 
         route = predict_route(
